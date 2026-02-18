@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:ena.support.keysight.com)",
+      "WebFetch(domain:coppermountaintech.com)",
+      "WebFetch(domain:helpfiles.keysight.com)",
+      "Bash(python -c:*)"
+    ]
+  }
+}
