@@ -4,7 +4,8 @@
       "WebFetch(domain:ena.support.keysight.com)",
       "WebFetch(domain:coppermountaintech.com)",
       "WebFetch(domain:helpfiles.keysight.com)",
-      "Bash(python -c:*)"
+      "Bash(python -c:*)",
+      "mcp__Claude_Code_Remote__list_repos"
     ]
   }
 }
