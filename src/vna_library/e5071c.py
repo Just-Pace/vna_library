@@ -1,12 +1,15 @@
 # src/vna_library/e5071c.py
 from __future__ import annotations
-from dataclasses import dataclass
-import math
-from typing import Iterable, List, Sequence, Tuple, Optional
 
-import pyvisa
+import math
+from typing import Any, List, Optional, Protocol, Sequence, Tuple
 
 from .models import SweepConfig, TraceSpec, EquationSpec, LimitTable, MarkerSpec, MarkerFunc, LimitType
+
+try:
+    import pyvisa
+except ImportError:  # pragma: no cover - pyvisa only needed for real hardware
+    pyvisa = None
 
 # (type, f_start_hz, f_stop_hz, y_start, y_stop)
 LimitSeg = Tuple[int, float, float, float, float]
@@ -16,24 +19,87 @@ class InstrumentError(VNAError): ...
 class VNATimeout(VNAError): ...
 
 
+class VisaSession(Protocol):
+    """The minimal transport interface E5071C needs.
+
+    Satisfied by a pyvisa MessageBasedResource, or by a fake in tests.
+    """
+    timeout: Any
+
+    def write(self, cmd: str) -> Any: ...
+    def query(self, cmd: str) -> str: ...
+    def query_ascii_values(self, cmd: str) -> List[float]: ...
+    def close(self) -> None: ...
+
+
+def _open_visa(resource: str, timeout_ms: int) -> VisaSession:
+    if pyvisa is None:
+        raise ImportError(
+            "pyvisa is required to open a real instrument; "
+            "install it or pass a session object instead of a resource string"
+        )
+    rm = pyvisa.ResourceManager()
+    session = rm.open_resource(resource)
+    session.timeout = timeout_ms
+    session.write_termination = "\n"
+    session.read_termination = "\n"
+    return session
+
+
 class E5071C:
-    def __init__(self, resource: str, timeout_ms: int = 30000):
-        rm = pyvisa.ResourceManager()
-        self.inst = rm.open_resource(resource)
-        self.inst.timeout = timeout_ms
-        self.inst.write_termination = "\n"
-        self.inst.read_termination = "\n"
+    """Driver for the Keysight E5071C ENA vector network analyzer.
+
+    Accepts either a VISA resource string (opened via pyvisa) or any object
+    implementing VisaSession — the latter lets tests run against a fake
+    transport with no hardware or pyvisa installed.
+    """
+
+    def __init__(self, session: VisaSession | str, timeout_ms: int = 30000):
+        if isinstance(session, str):
+            session = _open_visa(session, timeout_ms)
+        self.inst = session
         self._marker_domain: dict[int, tuple[float, float]] = {}  # ch → (start, stop)
 
+    @classmethod
+    def open(cls, resource: str, timeout_ms: int = 30000) -> "E5071C":
+        """Open a real instrument by VISA resource string."""
+        return cls(_open_visa(resource, timeout_ms))
+
+    def close(self) -> None:
+        self.inst.close()
+
+    def __enter__(self) -> "E5071C":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.close()
+        return False
+
     # low-level
+    def _translate(self, exc: Exception, cmd: str) -> Exception:
+        if pyvisa is not None and isinstance(exc, pyvisa.errors.VisaIOError):
+            if exc.error_code == pyvisa.constants.StatusCode.error_timeout:
+                return VNATimeout(f"timeout during {cmd!r}")
+            return InstrumentError(f"VISA error during {cmd!r}: {exc}")
+        return exc
+
     def write(self, cmd: str) -> None:
-        self.inst.write(cmd)
+        try:
+            self.inst.write(cmd)
+        except Exception as exc:
+            raise self._translate(exc, cmd) from exc
 
     def query(self, cmd: str) -> str:
-        return self.inst.query(cmd)
+        try:
+            return self.inst.query(cmd)
+        except Exception as exc:
+            raise self._translate(exc, cmd) from exc
 
     def query_values(self, cmd: str) -> List[float]:
-        return self.inst.query_ascii_values(cmd)
+        try:
+            return self.inst.query_ascii_values(cmd)
+        except Exception as exc:
+            raise self._translate(exc, cmd) from exc
 
     def opc(self) -> None:
         self.query("*OPC?")
@@ -41,16 +107,22 @@ class E5071C:
     def get_errors(self) -> List[str]:
         """
         Query and return all errors from the instrument error queue.
-        
+
         Returns:
             List of error strings. Empty list if no errors.
         """
         errors = []
         while True:
             err = self.query("SYST:ERR?").strip()
-            if err.startswith("+0"):
+            try:
+                code = int(err.split(",", 1)[0])
+            except ValueError:
+                code = None
+            if code == 0:
                 break
             errors.append(err)
+            if code is None:
+                break
         return errors
 
     # basics
@@ -95,11 +167,28 @@ class E5071C:
         self.write(f'CALC{ch}:PAR:SEL "{trace_name}"')
 
     # limits (Phase-1)
+    #
+    # E5071C limit tables are PER-TRACE: every limit command below acts on the
+    # currently selected trace (CALC:PAR:SEL).  To put limits on several traces,
+    # select each trace and apply its table separately.
     def limits_on(self, ch: int = 1) -> None:
         self.write(f"CALC{ch}:LIM:STAT ON")
 
-    def limits_clear(self, ch: int = 1) -> None:
-        self.write(f"CALC{ch}:LIM:DEL:ALL")
+    def limits_clear(self, ch: int = 1, meas_name: Optional[str] = None) -> None:
+        """Clear the limit table of the selected trace.
+
+        The E5071C has no CALC:LIM:DEL:ALL command (that is PNA-family
+        syntax and produces an 'Undefined header' error here); the documented
+        way to clear a table is writing a zero-segment table.
+
+        Args:
+            ch: Channel number.
+            meas_name: Optional trace to select first.  If None, clears the
+                currently selected trace's table.
+        """
+        if meas_name is not None:
+            self.select_trace(meas_name, ch=ch)
+        self.write(f"CALC{ch}:LIM:DATA 0")
 
     def apply_limit_table_bulk(
         self,
@@ -122,12 +211,20 @@ class E5071C:
           frequencies in Hz
           Y units match the currently selected format (dB, dBm, etc.)
 
+        Limit tables are per-trace.  The table lands on the selected trace, so
+        pass meas_name (or select_trace() yourself) for every trace you load;
+        loading a second trace's table without re-selecting overwrites the
+        first trace's table instead.
+
         Args:
             table: LimitTable containing segments to apply.
             ch: Channel number (default: 1).
-            meas_name: Optional measurement/trace name (e.g., "TR2", "EQ1"). 
+            meas_name: Optional measurement/trace name (e.g., "TR2", "EQ1").
                       If None, uses currently selected trace (caller must ensure correct selection).
-            clear_first: If True, clear existing limits before applying new ones.
+            clear_first: If True, clear the selected trace's table (zero-segment
+                      write) before loading.  Mostly redundant since LIM:DATA
+                      replaces the whole table, but kept as a belt-and-braces
+                      reset of any editor state.
             enable_display: If True, enable limit line display.
             enable_test: If True, enable limit testing.
             check_errors: If True, check for instrument errors after writing limit data.
@@ -137,10 +234,6 @@ class E5071C:
                        or if f_stop_hz <= f_start_hz.
             InstrumentError: If instrument reports an error after writing limit data
                             (only if check_errors=True).
-
-        Note:
-            This method requires :CALC{ch}:LIM:STAT ON to actually activate limit testing.
-            The method enables this automatically when enable_test=True.
         """
         # Convert LimitTable to tuple format
         segments: Sequence[LimitSeg] = [
@@ -152,8 +245,7 @@ class E5071C:
 
         if meas_name is not None:
             # Select the measurement/trace you want the limits applied to
-
-            self.write(f'CALC{ch}:PAR:SEL "{meas_name}"')
+            self.select_trace(meas_name, ch=ch)
 
         # Validate + flatten
         flat: list[str] = [str(len(segments))]
@@ -175,8 +267,13 @@ class E5071C:
             flat.append(f"{float(ys):.12g}")
             flat.append(f"{float(ye):.12g}")
 
+        if check_errors:
+            # Start from a clean status/error state so *ESR? below reflects
+            # only this load, not stale errors from earlier commands.
+            self.write("*CLS")
+
         if clear_first:
-            self.write(f"CALC{ch}:LIM:DEL:ALL")
+            self.write(f"CALC{ch}:LIM:DATA 0")
 
         # One-shot bulk write, matching the sample's "NumSeg then comma stream" pattern.
         payload = ",".join(flat)
@@ -186,7 +283,8 @@ class E5071C:
         if check_errors:
             self.opc()  # wait for command completion
             esr = int(self.query("*ESR?"))
-            if esr & 0b00000100:  # Command error bit (bit 2)
+            # bits 2-5: query error, device-dependent, execution, command error
+            if esr & 0b00111100:
                 errors = self.get_errors()
                 raise InstrumentError(
                     f"Limit table load failed – instrument error: {errors[0] if errors else 'Unknown error'}"
@@ -196,15 +294,16 @@ class E5071C:
             self.write(f"CALC{ch}:LIM:DISP ON")
         if enable_test:
             self.write(f"CALC{ch}:LIM ON")
-            # Critical: Enable limit state to activate testing/judgment
-            self.write(f"CALC{ch}:LIM:STAT ON")
 
-    def query_limit_table(self, ch: int = 1) -> List[LimitSeg]:
+    def query_limit_table(self, ch: int = 1, meas_name: Optional[str] = None) -> List[LimitSeg]:
         """
         Query and parse the current limit table from the instrument.
 
+        Limit tables are per-trace: this reads the selected trace's table.
+
         Args:
             ch: Channel number (default: 1).
+            meas_name: Optional trace to select first.
 
         Returns:
             List of limit segments as tuples (type, f_start_hz, f_stop_hz, y_start, y_stop).
@@ -213,17 +312,19 @@ class E5071C:
         Raises:
             InstrumentError: If the instrument reports an error.
         """
+        if meas_name is not None:
+            self.select_trace(meas_name, ch=ch)
         self.write("FORM:DATA ASC")
         values = self.query_values(f"CALC{ch}:LIM:DATA?")
-        
+
         if not values:
             return []
-        
+
         # First value is the count
         count = int(values[0])
         if count == 0:
             return []
-        
+
         # Remaining values are groups of 5: type, f_start, f_stop, y_start, y_stop
         segments = []
         for i in range(count):
@@ -236,19 +337,34 @@ class E5071C:
             y_start = float(values[idx + 3])
             y_stop = float(values[idx + 4])
             segments.append((typ, f_start, f_stop, y_start, y_stop))
-        
+
         return segments
 
     # sweep & data
     def single_sweep(self, ch: int = 1) -> None:
-        self.write("INIT:CONT OFF")
-        self.write("*TRG")
+        """Run one sweep on a channel and block until it completes.
+
+        Uses the E5071C bus-trigger pattern: trigger source BUS, continuous
+        initiate ON (arms the channel), then :TRIG:SING which *OPC? waits on.
+
+        Note: *TRG with INIT:CONT OFF (the previous implementation) fails on
+        this instrument — *TRG errors unless the source is BUS, and a held
+        channel never re-arms.
+        """
+        self.write("TRIG:SOUR BUS")
+        self.write(f"INIT{ch}:CONT ON")
+        self.write("TRIG:SING")
         self.opc()
 
     def fetch_fdata_pairs(self, ch: int = 1) -> List[Tuple[float, float]]:
         self.write("FORM:DATA ASC")
         raw = self.query_values(f"CALC{ch}:DATA:FDATA?")
         return list(zip(raw[0::2], raw[1::2]))
+
+    def fetch_frequencies(self, ch: int = 1) -> List[float]:
+        """Read the stimulus (frequency) axis for a channel, in Hz."""
+        self.write("FORM:DATA ASC")
+        return self.query_values(f"SENS{ch}:FREQ:DATA?")
 
     # markers (Phase-1)
     def marker_enable(self, idx: int, ch: int = 1, on: bool = True) -> None:
@@ -298,7 +414,7 @@ class E5071C:
         if prev is not None and prev != band:
             raise InstrumentError(
                 f"Channel {ch} marker domain already set to "
-                f"{prev[0]:.6g}\u2013{prev[1]:.6g} Hz. "
+                f"{prev[0]:.6g}–{prev[1]:.6g} Hz. "
                 f"Call marker_clear_domain({ch}) before changing band."
             )
         self.write(f"CALC{ch}:MARK:FUNC:DOM:STAR {f_start_hz:.12g}")
