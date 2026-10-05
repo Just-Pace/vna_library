@@ -4,7 +4,8 @@ Active Match Measurement Recipe
 
 Demonstrates proper vna_library architecture:
 - Uses models for configuration (SweepConfig, TraceSpec, etc.)
-- Uses E5071C driver for hardware control
+- Programs against the instrument-agnostic VNA interface; connect()
+  picks the driver (E5071C or PNA family) from *IDN?
 - Orchestrates measurement workflow at recipe level
 
 Measurement: Active Match = sqrt(|S11|^2 + |S21|^2)
@@ -27,7 +28,8 @@ for _p in (_REPO_ROOT / "src", _REPO_ROOT):
         sys.path.insert(0, str(_p))
 
 from vna_library import (  # noqa: E402
-    E5071C,
+    VNA,
+    connect,
     SweepConfig,
     TraceSpec,
     EquationSpec,
@@ -87,7 +89,13 @@ def measure_active_match(
     apply_s11_limits: bool = True,
     ch: int = 1,
 ) -> Dict[str, BandResult]:
-    """Configure the E5071C, sweep, and read the worst-case active match per band.
+    """Configure the VNA, sweep, and read the worst-case active match per band.
+
+    Instrument-agnostic: the driver is picked from *IDN? via connect(),
+    so this runs unchanged on an E5071C or a PNA-family instrument
+    (E5080A/B, ENA-X, N52xx, P50xx, M980x).  Note the equation-editor
+    expression syntax differs between families; ACTIVE_MATCH is written
+    for the E5071C editor and may need adjusting for the PNA editor.
 
     Workflow:
       1. Preset and apply the wideband sweep.
@@ -105,7 +113,7 @@ def measure_active_match(
     Returns:
         Mapping of band name -> :class:`BandResult`.
     """
-    vna = E5071C(resource)
+    vna: VNA = connect(resource)
     vna.preset()
     vna.apply_sweep(SWEEP, ch=ch)
 

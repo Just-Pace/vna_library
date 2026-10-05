@@ -1,5 +1,8 @@
 # src/vna_library/__init__.py
-from .e5071c import E5071C, VNAError, InstrumentError, VNATimeout
+from .base import VNA, ScpiVNA, VNAError, InstrumentError, VNATimeout
+from .e5071c import E5071C
+from .pna_family import PNAFamily
+from .factory import connect, driver_for_idn
 from .models import (
     SweepConfig, TraceSpec, EquationSpec,
     LimitType, LimitSegment, LimitTable,
@@ -7,7 +10,13 @@ from .models import (
 )
 
 __all__ = [
-    "E5071C", "VNAError", "InstrumentError", "VNATimeout",
+    # interface & factory
+    "VNA", "ScpiVNA", "connect", "driver_for_idn",
+    # drivers
+    "E5071C", "PNAFamily",
+    # errors
+    "VNAError", "InstrumentError", "VNATimeout",
+    # models
     "SweepConfig", "TraceSpec", "EquationSpec",
     "LimitType", "LimitSegment", "LimitTable",
     "MarkerFunc", "MarkerSpec",
