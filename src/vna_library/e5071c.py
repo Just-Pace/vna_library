@@ -2,51 +2,25 @@
 from __future__ import annotations
 
 import math
-from typing import Any, List, Optional, Protocol, Sequence, Tuple
+from typing import List, Optional, Tuple
 
+from .base import (
+    InstrumentError,
+    ScpiInstrument,
+    VisaSession,
+    VNAError,
+    VNATimeout,
+    format_limit_payload,
+)
 from .models import SweepConfig, TraceSpec, EquationSpec, LimitTable, MarkerSpec, MarkerFunc, LimitType
 
-try:
-    import pyvisa
-except ImportError:  # pragma: no cover - pyvisa only needed for real hardware
-    pyvisa = None
+__all__ = ["E5071C", "VNAError", "InstrumentError", "VNATimeout", "VisaSession", "LimitSeg"]
 
 # (type, f_start_hz, f_stop_hz, y_start, y_stop)
 LimitSeg = Tuple[int, float, float, float, float]
 
-class VNAError(Exception): ...
-class InstrumentError(VNAError): ...
-class VNATimeout(VNAError): ...
 
-
-class VisaSession(Protocol):
-    """The minimal transport interface E5071C needs.
-
-    Satisfied by a pyvisa MessageBasedResource, or by a fake in tests.
-    """
-    timeout: Any
-
-    def write(self, cmd: str) -> Any: ...
-    def query(self, cmd: str) -> str: ...
-    def query_ascii_values(self, cmd: str) -> List[float]: ...
-    def close(self) -> None: ...
-
-
-def _open_visa(resource: str, timeout_ms: int) -> VisaSession:
-    if pyvisa is None:
-        raise ImportError(
-            "pyvisa is required to open a real instrument; "
-            "install it or pass a session object instead of a resource string"
-        )
-    rm = pyvisa.ResourceManager()
-    session = rm.open_resource(resource)
-    session.timeout = timeout_ms
-    session.write_termination = "\n"
-    session.read_termination = "\n"
-    return session
-
-
-class E5071C:
+class E5071C(ScpiInstrument):
     """Driver for the Keysight E5071C ENA vector network analyzer.
 
     Accepts either a VISA resource string (opened via pyvisa) or any object
@@ -55,86 +29,16 @@ class E5071C:
     """
 
     def __init__(self, session: VisaSession | str, timeout_ms: int = 30000):
-        if isinstance(session, str):
-            session = _open_visa(session, timeout_ms)
-        self.inst = session
+        super().__init__(session, timeout_ms)
         self._marker_domain: dict[int, tuple[float, float]] = {}  # ch → (start, stop)
 
-    @classmethod
-    def open(cls, resource: str, timeout_ms: int = 30000) -> "E5071C":
-        """Open a real instrument by VISA resource string."""
-        return cls(_open_visa(resource, timeout_ms))
-
-    def close(self) -> None:
-        self.inst.close()
-
-    def __enter__(self) -> "E5071C":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> bool:
-        self.close()
-        return False
-
-    # low-level
-    def _translate(self, exc: Exception, cmd: str) -> Exception:
-        if pyvisa is not None and isinstance(exc, pyvisa.errors.VisaIOError):
-            if exc.error_code == pyvisa.constants.StatusCode.error_timeout:
-                return VNATimeout(f"timeout during {cmd!r}")
-            return InstrumentError(f"VISA error during {cmd!r}: {exc}")
-        return exc
-
-    def write(self, cmd: str) -> None:
-        try:
-            self.inst.write(cmd)
-        except Exception as exc:
-            raise self._translate(exc, cmd) from exc
-
-    def query(self, cmd: str) -> str:
-        try:
-            return self.inst.query(cmd)
-        except Exception as exc:
-            raise self._translate(exc, cmd) from exc
-
-    def query_values(self, cmd: str) -> List[float]:
-        try:
-            return self.inst.query_ascii_values(cmd)
-        except Exception as exc:
-            raise self._translate(exc, cmd) from exc
-
-    def opc(self) -> None:
-        self.query("*OPC?")
-
-    def get_errors(self) -> List[str]:
-        """
-        Query and return all errors from the instrument error queue.
-
-        Returns:
-            List of error strings. Empty list if no errors.
-        """
-        errors = []
-        while True:
-            err = self.query("SYST:ERR?").strip()
-            try:
-                code = int(err.split(",", 1)[0])
-            except ValueError:
-                code = None
-            if code == 0:
-                break
-            errors.append(err)
-            if code is None:
-                break
-        return errors
-
     # basics
-    def idn(self) -> str:
-        return self.query("*IDN?").strip()
-
     def preset(self) -> None:
         self.write("SYST:PRES")
         self._marker_domain.clear()
 
     def reset(self) -> None:
-        self.write("*RST")
+        super().reset()
         self._marker_domain.clear()
 
     # configuration
@@ -235,37 +139,12 @@ class E5071C:
             InstrumentError: If instrument reports an error after writing limit data
                             (only if check_errors=True).
         """
-        # Convert LimitTable to tuple format
-        segments: Sequence[LimitSeg] = [
-            (int(seg.kind), seg.f_start_hz, seg.f_stop_hz, seg.y_start_db, seg.y_stop_db)
-            for seg in table.segments
-        ]
-        if not segments:
-            raise ValueError("segments is empty")
+        # Validate + flatten (raises ValueError before anything is written)
+        payload = format_limit_payload(table, include_count=True)
 
         if meas_name is not None:
             # Select the measurement/trace you want the limits applied to
             self.select_trace(meas_name, ch=ch)
-
-        # Validate + flatten
-        flat: list[str] = [str(len(segments))]
-
-        for i, (typ, fs, fe, ys, ye) in enumerate(segments, start=1):
-            if typ not in (1, 2):
-                raise ValueError(f"segment {i}: typ must be 1 (MAX) or 2 (MIN), got {typ}")
-            for name, v in (("fs", fs), ("fe", fe), ("ys", ys), ("ye", ye)):
-                if not isinstance(v, (int, float)) or not math.isfinite(float(v)):
-                    raise ValueError(f"segment {i}: {name} must be a finite number, got {v!r}")
-            if fe <= fs:
-                raise ValueError(f"segment {i}: f_stop_hz must be > f_start_hz (got {fs} .. {fe})")
-
-            # Important: keep formatting “boring” (no thousands separators, no units).
-            # .12g is usually safe for SCPI numeric parsing.
-            flat.append(str(int(typ)))
-            flat.append(f"{float(fs):.12g}")
-            flat.append(f"{float(fe):.12g}")
-            flat.append(f"{float(ys):.12g}")
-            flat.append(f"{float(ye):.12g}")
 
         if check_errors:
             # Start from a clean status/error state so *ESR? below reflects
@@ -276,19 +155,12 @@ class E5071C:
             self.write(f"CALC{ch}:LIM:DATA 0")
 
         # One-shot bulk write, matching the sample's "NumSeg then comma stream" pattern.
-        payload = ",".join(flat)
         self.write(f"CALC{ch}:LIM:DATA {payload}")
 
         # Wait for command completion and check for errors
         if check_errors:
             self.opc()  # wait for command completion
-            esr = int(self.query("*ESR?"))
-            # bits 2-5: query error, device-dependent, execution, command error
-            if esr & 0b00111100:
-                errors = self.get_errors()
-                raise InstrumentError(
-                    f"Limit table load failed – instrument error: {errors[0] if errors else 'Unknown error'}"
-                )
+            self.check_esr("Limit table load failed")
 
         if enable_display:
             self.write(f"CALC{ch}:LIM:DISP ON")
