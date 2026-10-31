@@ -32,17 +32,27 @@ def test_define_trace_uses_meas_numbers(pna, session):
     pna.define_trace(TraceSpec(name="ignored", sparam="S21"), meas=2, window=1)
     assert session.writes == [
         'CALC1:MEAS2:DEF "S21"',
+        "DISP:WIND1 ON",
         "DISP:MEAS2:FEED 1",
         "CALC1:MEAS2:FORM MLOG",
     ]
 
 
 def test_define_equation_targets_existing_measurement(pna, session):
+    session.responses["CALC1:MEAS3:EQU:VAL?"] = "1"
     pna.define_equation(EquationSpec(name="AM", expression="sqrt(abs(S11)^2+abs(S21)^2)"), meas=3)
     assert session.writes == [
-        'CALC1:MEAS3:EQU:DEF "sqrt(abs(S11)^2+abs(S21)^2)"',
+        'CALC1:MEAS3:EQU:TEXT "sqrt(abs(S11)^2+abs(S21)^2)"',
+        "CALC1:MEAS3:EQU:VAL?",
         "CALC1:MEAS3:EQU:STAT ON",
     ]
+
+
+def test_define_equation_rejects_invalid_expression(pna, session):
+    session.responses["CALC1:MEAS1:EQU:VAL?"] = "0"
+    with pytest.raises(InstrumentError, match="equation rejected"):
+        pna.define_equation(EquationSpec(name="bad", expression="sqrtt(S11)"))
+    assert "CALC1:MEAS1:EQU:STAT ON" not in session.writes
 
 
 def test_apply_sweep_matches_ena_dialect(pna, session):
@@ -97,6 +107,13 @@ def test_limit_two_measurements_are_independent(pna, session):
 def test_apply_limit_rejects_empty_table(pna):
     with pytest.raises(ValueError, match="empty"):
         pna.apply_limit_table_bulk(LimitTable(segments=()))
+
+
+def test_limit_fail_query(pna, session):
+    session.responses["CALC1:MEAS2:LIM:FAIL?"] = "1"
+    assert pna.limit_fail(meas=2) is True
+    session.responses["CALC1:MEAS2:LIM:FAIL?"] = "0"
+    assert pna.limit_fail(meas=2) is False
 
 
 def test_query_limit_table_no_count_prefix(pna, session):

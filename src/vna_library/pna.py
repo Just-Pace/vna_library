@@ -22,7 +22,7 @@ from __future__ import annotations
 
 from typing import List, Tuple
 
-from .base import ScpiInstrument, format_limit_payload
+from .base import InstrumentError, ScpiInstrument, format_limit_payload
 from .models import SweepConfig, TraceSpec, EquationSpec, LimitTable, MarkerSpec, MarkerFunc
 
 # (type, f_start_hz, f_stop_hz, y_start, y_stop)
@@ -59,6 +59,9 @@ class PNA(ScpiInstrument):
     def define_trace(self, trace: TraceSpec, ch: int = 1, window: int = 1, meas: int = 1) -> None:
         """Create measurement number ``meas`` and feed it to a display window.
 
+        The window is turned on first (CALC:MEAS:DEF creates the measurement
+        but does not display it, and FEED needs an existing window).
+
         Note:
             The PNA platform addresses measurements by number, so
             ``trace.name`` is not sent to the instrument — pick ``meas``
@@ -66,18 +69,39 @@ class PNA(ScpiInstrument):
             want names.
         """
         self.write(f'CALC{ch}:MEAS{meas}:DEF "{trace.sparam}"')
+        self.write(f"DISP:WIND{window} ON")
         self.write(f"DISP:MEAS{meas}:FEED {window}")
         self.write(f"CALC{ch}:MEAS{meas}:FORM {trace.fmt}")
 
-    def define_equation(self, eq: EquationSpec, ch: int = 1, meas: int = 1) -> None:
+    def define_equation(self, eq: EquationSpec, ch: int = 1, meas: int = 1, check_valid: bool = True) -> None:
         """Apply an equation to an EXISTING measurement.
 
         Unlike the E5071C (where an equation is a trace type of its own),
         the PNA equation editor attaches an expression to an existing
         measurement — create one with define_trace() first, then apply the
-        equation to it.  ``eq.name`` is not sent to the instrument.
+        equation to it.  ``eq.name`` is not sent to the instrument unless
+        you include it in the expression itself ("name=expr").
+
+        Args:
+            eq: The equation; expression may be bare ("S11/S21") or named
+                ("foo=S11/S21").
+            ch: Channel number.
+            meas: Measurement number.
+            check_valid: If True, query EQU:VALid? after loading and raise
+                if the instrument rejected the expression — an invalid
+                equation is otherwise silently ignored at sweep time.
+
+        Raises:
+            InstrumentError: If check_valid and the equation is not valid.
         """
-        self.write(f'CALC{ch}:MEAS{meas}:EQU:DEF "{eq.expression}"')
+        self.write(f'CALC{ch}:MEAS{meas}:EQU:TEXT "{eq.expression}"')
+        if check_valid:
+            valid = self.query(f"CALC{ch}:MEAS{meas}:EQU:VAL?").strip()
+            if valid not in ("1", "+1"):
+                raise InstrumentError(
+                    f"equation rejected by instrument: {eq.expression!r} "
+                    f"(CALC{ch}:MEAS{meas}:EQU:VAL? returned {valid!r})"
+                )
         self.write(f"CALC{ch}:MEAS{meas}:EQU:STAT ON")
 
     # limits
@@ -133,6 +157,14 @@ class PNA(ScpiInstrument):
             self.write(f"CALC{ch}:MEAS{meas}:LIM:DISP ON")
         if enable_test:
             self.write(f"CALC{ch}:MEAS{meas}:LIM:STAT ON")
+
+    def limit_fail(self, ch: int = 1, meas: int = 1) -> bool:
+        """Return True if the limit test FAILED for any point on a measurement.
+
+        Wraps CALC:MEAS:LIM:FAIL? (1 = fail, 0 = pass).  Trigger a sweep
+        after enabling limit testing before trusting this.
+        """
+        return self.query(f"CALC{ch}:MEAS{meas}:LIM:FAIL?").strip() in ("1", "+1")
 
     def query_limit_table(self, ch: int = 1, meas: int = 1) -> List[LimitSeg]:
         """Read back a measurement's limit table.
@@ -190,7 +222,7 @@ class PNA(ScpiInstrument):
         """Enable or disable a marker on a measurement.
 
         Args:
-            idx: Marker number (1-15 on this platform).
+            idx: Marker number (1-15; marker 16 is the reference marker).
             ch: Channel number.
             meas: Measurement number.
             on: True to enable, False to disable.
