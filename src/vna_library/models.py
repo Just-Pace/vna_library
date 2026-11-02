@@ -90,18 +90,19 @@ class MarkerFunc(str, Enum):
 class MarkerSpec:
     """Marker search specification for E5071C.
 
-    Note: The search domain range (f_start_hz / f_stop_hz) is per-channel
-    on the E5071C, not per-marker.  All markers on a channel share one range.
+    Note: The usable marker range is dialect-specific: E5071C markers are
+    1-9 plus 10 as the reference marker; PNA-family markers are 1-15 plus
+    16 as the reference marker.  Drivers validate their own stricter range.
     """
-    index: int                          # 1..9 (10 = reference marker)
+    index: int
     f_start_hz: float
     f_stop_hz: float
     func: MarkerFunc = MarkerFunc.MIN
     enable_domain: bool = True
 
     def __post_init__(self) -> None:
-        if not 1 <= self.index <= 10:
-            raise ValueError(f"index must be 1..10, got {self.index}")
+        if not 1 <= self.index <= 16:
+            raise ValueError(f"index must be 1..16, got {self.index}")
         _require_finite("f_start_hz", self.f_start_hz)
         _require_finite("f_stop_hz", self.f_stop_hz)
         if self.enable_domain and self.f_stop_hz <= self.f_start_hz:

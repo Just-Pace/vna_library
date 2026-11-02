@@ -28,8 +28,8 @@ class E5071C(ScpiInstrument):
     transport with no hardware or pyvisa installed.
     """
 
-    def __init__(self, session: VisaSession | str, timeout_ms: int = 30000):
-        super().__init__(session, timeout_ms)
+    def __init__(self, session: VisaSession | str, timeout_ms: int = 30000, backend: str | None = None):
+        super().__init__(session, timeout_ms, backend)
         self._marker_domain: dict[int, tuple[float, float]] = {}  # ch → (start, stop)
 
     # basics
@@ -53,18 +53,56 @@ class E5071C(ScpiInstrument):
         self.write(f"SOUR{ch}:POW {sweep.power_dbm}")
 
     def clear_traces(self, ch: int = 1) -> None:
-        self.write(f"CALC{ch}:PAR:DEL:ALL")
+        """Reset a channel to a single trace (the E5071C minimum).
+
+        The E5071C has no documented CALC:PAR:DEL:ALL; the per-channel trace
+        count is managed with CALC{ch}:PAR:COUN (preset value 1).
+        """
+        self.write(f"CALC{ch}:PAR:COUN 1")
 
     def define_trace(self, trace: TraceSpec, ch: int = 1, window: int = 1, trace_num: int = 1) -> None:
         self.write(f'CALC{ch}:PAR:DEF "{trace.name}","{trace.sparam}"')
         self.write(f'DISP:WIND{window}:TRAC{trace_num}:FEED "{trace.name}"')
         self.write(f"CALC{ch}:FORM {trace.fmt}")
 
-    def define_equation(self, eq: EquationSpec, ch: int = 1, window: int = 1, trace_num: int = 3) -> None:
-        self.write(f'CALC{ch}:PAR:DEF "{eq.name}",EQU')
-        self.write(f'CALC{ch}:PAR:SEL "{eq.name}"')
-        self.write(f'CALC{ch}:EQU:DEF "{eq.expression}"')
-        self.write(f'DISP:WIND{window}:TRAC{trace_num}:FEED "{eq.name}"')
+    def define_equation(
+        self,
+        eq: EquationSpec,
+        ch: int = 1,
+        meas_name: Optional[str] = None,
+        check_valid: bool = True,
+    ) -> None:
+        """Apply an equation to an EXISTING trace (the equation editor).
+
+        The E5071C equation editor attaches an expression to a trace via
+        CALC:EQU:TEXT — there is no EQU:DEF command, and "EQU" is not a
+        valid CALC:PAR:DEF parameter.  Create a trace with define_trace()
+        first, then apply the equation to it.  ``eq.name`` is only sent if
+        you embed it in the expression itself ("name=expr").
+
+        Args:
+            eq: The equation; expression may be bare ("S21/S11") or named
+                ("foo=S21/S11").
+            ch: Channel number.
+            meas_name: Optional trace to select first.  If None, applies to
+                the currently selected trace.
+            check_valid: If True, query EQU:VALid? after loading and raise
+                if the instrument rejected the expression — an invalid
+                equation is otherwise silently ignored at sweep time.
+
+        Raises:
+            InstrumentError: If check_valid and the equation is not valid.
+        """
+        if meas_name is not None:
+            self.select_trace(meas_name, ch=ch)
+        self.write(f'CALC{ch}:EQU:TEXT "{eq.expression}"')
+        if check_valid:
+            valid = self.query(f"CALC{ch}:EQU:VAL?").strip()
+            if valid not in ("1", "+1"):
+                raise InstrumentError(
+                    f"equation rejected by instrument: {eq.expression!r} "
+                    f"(CALC{ch}:EQU:VAL? returned {valid!r})"
+                )
         self.write(f"CALC{ch}:EQU:STAT ON")
 
     def select_trace(self, trace_name: str, ch: int = 1) -> None:
@@ -239,6 +277,11 @@ class E5071C(ScpiInstrument):
         return self.query_values(f"SENS{ch}:FREQ:DATA?")
 
     # markers (Phase-1)
+    @staticmethod
+    def _check_marker_index(idx: int) -> None:
+        if not 1 <= idx <= 10:
+            raise ValueError(f"E5071C marker index must be 1-10 (10 = reference), got {idx}")
+
     def marker_enable(self, idx: int, ch: int = 1, on: bool = True) -> None:
         """Enable or disable a marker.
 
@@ -247,6 +290,7 @@ class E5071C(ScpiInstrument):
             ch: Channel number.
             on: True to enable, False to disable.
         """
+        self._check_marker_index(idx)
         self.write(f"CALC{ch}:MARK{idx}:STAT {'ON' if on else 'OFF'}")
 
     def marker_set_function(self, idx: int, func: MarkerFunc, ch: int = 1) -> None:

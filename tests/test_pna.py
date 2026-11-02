@@ -151,16 +151,22 @@ def test_fetch_frequencies_uses_x_values(pna, session):
 
 # --- markers ----------------------------------------------------------------
 
-def test_marker_configure_uses_per_marker_user_range(pna, session):
+def test_marker_configure_allocates_user_range(pna, session):
     spec = MarkerSpec(index=2, f_start_hz=1.0e9, f_stop_hz=2.0e9, func=MarkerFunc.MAX)
     pna.marker_configure(spec, meas=3)
     assert session.writes == [
         "CALC1:MEAS3:MARK2:STAT ON",
-        "CALC1:MEAS3:MARK2:FUNC:DOM:USER 2",
+        "CALC1:MEAS3:MARK2:FUNC:DOM:USER 1",
         "CALC1:MEAS3:MARK2:FUNC:DOM:USER:STAR 1000000000",
         "CALC1:MEAS3:MARK2:FUNC:DOM:USER:STOP 2000000000",
         "CALC1:MEAS3:MARK2:FUNC:EXEC MAX",
     ]
+
+
+def test_marker_configure_without_domain_resets_to_full_span(pna, session):
+    spec = MarkerSpec(index=2, f_start_hz=0.0, f_stop_hz=0.0, func=MarkerFunc.MIN, enable_domain=False)
+    pna.marker_configure(spec, meas=1)
+    assert "CALC1:MEAS1:MARK2:FUNC:DOM:USER 0" in session.writes
 
 
 def test_markers_can_use_different_bands_without_conflict(pna, session):
