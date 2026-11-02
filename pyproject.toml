@@ -4,13 +4,18 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vna-library"
-version = "0.1.0"
-description = "Python control library for the Keysight E5071C ENA vector network analyzer"
+version = "0.2.0"
+description = "Python control library for Keysight vector network analyzers (E5071C ENA and PNA-family)"
 readme = "README.md"
 requires-python = ">=3.10"
-dependencies = ["pyvisa>=1.13"]
+dependencies = ["pyvisa>=1.13,<2"]
 
 [project.optional-dependencies]
+# ONE VISA backend is required to open real instruments:
+# backend-py is pure Python (TCPIP/HiSLIP) — enough for P50xx/P93xx USB VNAs,
+# which are reached via HiSLIP to the host-PC firmware. For direct USB/GPIB
+# instruments install Keysight IO Libraries Suite instead.
+backend-py = ["pyvisa-py>=0.7"]
 dev = ["pytest>=8"]
 
 [tool.setuptools.packages.find]

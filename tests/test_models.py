@@ -52,7 +52,7 @@ def test_limit_table_from_iter():
     assert table.segments == tuple(segs)
 
 
-@pytest.mark.parametrize("index", [0, 11])
+@pytest.mark.parametrize("index", [0, 17])
 def test_marker_spec_rejects_bad_index(index):
     with pytest.raises(ValueError):
         MarkerSpec(index=index, f_start_hz=1e9, f_stop_hz=2e9)

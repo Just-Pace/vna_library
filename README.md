@@ -9,9 +9,39 @@ over VISA (pyvisa). Two drivers share one transport layer:
 
 ## Install
 
+Requires Python 3.10+. pyvisa alone cannot talk to instruments — it needs a
+**backend**, and that is the piece a fresh machine is missing when you see
+`Could not locate a VISA implementation`.
+
 ```bash
+# Library + tests (tests need no hardware and no backend):
 pip install -e ".[dev]"
+
+# Plus ONE backend to open real instruments — either:
+pip install -e ".[backend-py]"   # pyvisa-py: pure Python, no admin rights.
+                                 # TCPIP/HiSLIP — enough for P50xx/P93xx USB
+                                 # VNAs, which are reached via HiSLIP to the
+                                 # firmware running on the host PC.
+# ...or install a vendor library (adds direct USB/GPIB):
+#   Windows / Linux / macOS: Keysight IO Libraries Suite
+#     https://www.keysight.com/find/iosuite
+#   (NI-VISA also works.)
 ```
+
+The driver tries the vendor backend first and falls back to pyvisa-py
+automatically; force one with `PNA.open(resource, backend="@py")`. If neither
+is present, `open()` raises an error telling you exactly this.
+
+### Bench verification
+
+```bash
+python recipes/bench_check_pna.py TCPIP0::localhost::hislip0::INSTR
+```
+
+runs a non-destructive check sequence (measurement creation, independent
+limit tables, sweep, data lengths, marker band isolation, channel-scoped
+clearing) and prints PASS/FAIL per item. Run it once per instrument model /
+firmware before trusting the driver unattended.
 
 ## Usage
 
@@ -64,10 +94,11 @@ with PNA.open("TCPIP0::192.168.0.20::hislip0::INSTR") as vna:
 | Trace addressing | selected trace (`CALC:PAR:SEL "name"`) | measurement number (`CALC:MEAS<n>`) |
 | Limit table write | leading segment count required | **no** count prefix |
 | Clear limit table | `CALC:LIM:DATA 0` (no DELete cmd) | `CALC:MEAS<n>:LIM:DATA:DEL` |
+| Clear traces | `CALC:PAR:COUN 1` (no PAR:DEL:ALL) | per-meas `CALC:MEAS<n>:DEL` (`PAR:DEL:ALL` is **instrument-wide**) |
 | Formatted data | two values per point, always | one per point (two for Polar/Smith) |
 | Single sweep | `TRIG:SOUR BUS` + `TRIG:SING` | `TRIG:SOUR IMM` + `SENS:SWE:MODE SING` |
-| Marker search bands | one shared domain per channel | 16 independent user ranges |
-| Equation traces | equation is its own trace type | equation attaches to an existing measurement |
+| Marker search bands | one shared domain per channel | 16 user ranges per **channel** (driver allocates per measurement+marker) |
+| Equation traces | `EQU:TEXT` on an existing trace | `EQU:TEXT` on an existing measurement |
 
 ## Limit lines: things the instrument won't tell you
 

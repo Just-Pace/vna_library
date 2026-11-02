@@ -37,9 +37,19 @@ class PNA(ScpiInstrument):
     by construction.
     """
 
+    def __init__(self, session, timeout_ms: int = 30000, backend: str | None = None):
+        super().__init__(session, timeout_ms, backend)
+        # ch → {(meas, marker_idx): user_range}; see marker_set_range.
+        self._user_ranges: dict[int, dict[tuple[int, int], int]] = {}
+
     # basics
     def preset(self) -> None:
         self.write("SYST:PRES")
+        self._user_ranges.clear()
+
+    def reset(self) -> None:
+        super().reset()
+        self._user_ranges.clear()
 
     # configuration
     def apply_sweep(self, sweep: SweepConfig, ch: int = 1) -> None:
@@ -53,8 +63,28 @@ class PNA(ScpiInstrument):
         self.write(f"SOUR{ch}:POW {sweep.power_dbm}")
 
     def clear_traces(self, ch: int = 1) -> None:
-        """Delete all measurements on a channel."""
-        self.write(f"CALC{ch}:PAR:DEL:ALL")
+        """Delete all measurements on ONE channel.
+
+        CALC:PAR:DEL:ALL is documented as deleting every measurement on the
+        VNA regardless of any channel prefix, so this instead catalogs the
+        channel's measurement numbers (SYST:MEAS:CAT? <ch>) and deletes each
+        one.  For the instrument-wide operation use delete_all_measurements().
+        """
+        catalog = self.query(f"SYST:MEAS:CAT? {ch}").strip().strip('"')
+        if not catalog:
+            return
+        for mnum in (int(x) for x in catalog.split(",")):
+            self.write(f"CALC{ch}:MEAS{mnum}:DEL")
+        self._user_ranges.pop(ch, None)
+
+    def delete_all_measurements(self) -> None:
+        """Delete every measurement on the instrument — ALL channels.
+
+        This is CALC:PAR:DEL:ALL, which is instrument-wide on the PNA
+        platform.  Use clear_traces(ch) to clear a single channel.
+        """
+        self.write("CALC:PAR:DEL:ALL")
+        self._user_ranges.clear()
 
     def define_trace(self, trace: TraceSpec, ch: int = 1, window: int = 1, meas: int = 1) -> None:
         """Create measurement number ``meas`` and feed it to a display window.
@@ -229,6 +259,43 @@ class PNA(ScpiInstrument):
         """
         self.write(f"CALC{ch}:MEAS{meas}:MARK{idx}:STAT {'ON' if on else 'OFF'}")
 
+    def _allocate_user_range(self, ch: int, meas: int, idx: int, user_range: int | None) -> int:
+        """Pick a channel-unique user range for (meas, marker).
+
+        User ranges are a per-CHANNEL resource (16 of them), shared by every
+        measurement on the channel.  Naively reusing the marker index as the
+        range number makes marker 1 on two measurements silently share range
+        1 — configuring the second would move the first marker's search
+        bounds.  This allocator hands each (measurement, marker) pair its
+        own free range and remembers it, raising once all 16 are taken.
+        """
+        chmap = self._user_ranges.setdefault(ch, {})
+        key = (meas, idx)
+        if user_range is not None:
+            if not 1 <= user_range <= 16:
+                raise ValueError(f"user_range must be 1..16, got {user_range}")
+            others = {k for k, r in chmap.items() if r == user_range and k != key}
+            if others:
+                raise InstrumentError(
+                    f"user range {user_range} on channel {ch} is already used by "
+                    f"(meas, marker) {sorted(others)}; ranges are shared across the "
+                    f"whole channel, so reusing it would move that marker's search "
+                    f"bounds. Pick a different range or omit user_range."
+                )
+            chmap[key] = user_range
+            return user_range
+        if key in chmap:
+            return chmap[key]
+        used = set(chmap.values())
+        for rng in range(1, 17):
+            if rng not in used:
+                chmap[key] = rng
+                return rng
+        raise InstrumentError(
+            f"all 16 user ranges on channel {ch} are allocated; "
+            f"release some by reconfiguring or preset()"
+        )
+
     def marker_set_range(
         self,
         idx: int,
@@ -240,26 +307,39 @@ class PNA(ScpiInstrument):
     ) -> None:
         """Assign a marker to a user search range and set that range's span.
 
-        The PNA family has 16 user ranges per channel (range 0 = full span),
-        so unlike the E5071C, different markers can search different bands
-        simultaneously.  By default the marker uses the user range with its
-        own number, which keeps ranges independent per marker; pass
-        user_range explicitly to share a band between markers.
+        User ranges belong to the CHANNEL (16 per channel, range 0 = full
+        span) and are shared by all measurements on it.  By default this
+        allocates a free range per (measurement, marker) pair, so marker 1
+        on measurement 1 and marker 1 on measurement 2 get different ranges
+        and cannot disturb each other's search bounds.  Pass user_range
+        explicitly only to deliberately share a band; reusing a range that
+        another (measurement, marker) holds raises InstrumentError.
 
         Raises:
             ValueError: If f_stop_hz <= f_start_hz or user_range not in 1-16.
+            InstrumentError: If user_range is held by another marker, or all
+                16 ranges are allocated.
         """
         if f_stop_hz <= f_start_hz:
             raise ValueError(
                 f"f_stop_hz must be > f_start_hz (got {f_start_hz} .. {f_stop_hz})"
             )
-        rng = idx if user_range is None else user_range
-        if not 1 <= rng <= 16:
-            raise ValueError(f"user_range must be 1..16, got {rng}")
+        if not 1 <= idx <= 15:
+            raise ValueError(f"PNA marker index must be 1-15, got {idx}")
+        rng = self._allocate_user_range(ch, meas, idx, user_range)
         base = f"CALC{ch}:MEAS{meas}:MARK{idx}:FUNC:DOM:USER"
         self.write(f"{base} {rng}")
         self.write(f"{base}:STAR {f_start_hz:.12g}")
         self.write(f"{base}:STOP {f_stop_hz:.12g}")
+
+    def marker_clear_range(self, idx: int, ch: int = 1, meas: int = 1) -> None:
+        """Return a marker to full-span searching (user range 0).
+
+        Releases the user range previously allocated to this
+        (measurement, marker) pair, if any.
+        """
+        self.write(f"CALC{ch}:MEAS{meas}:MARK{idx}:FUNC:DOM:USER 0")
+        self._user_ranges.get(ch, {}).pop((meas, idx), None)
 
     def marker_search(self, idx: int, func: MarkerFunc, ch: int = 1, meas: int = 1) -> None:
         """Execute a marker search (MIN or MAX) within the marker's range."""
@@ -268,17 +348,23 @@ class PNA(ScpiInstrument):
     def marker_configure(self, spec: MarkerSpec, ch: int = 1, meas: int = 1) -> None:
         """Configure a marker from a MarkerSpec.
 
-        Orchestrates: enable -> assign user range (if enabled) -> execute
-        search.  Does NOT call opc(); sync once after configuring all markers.
+        Orchestrates: enable -> set or clear search range -> execute search.
+        Does NOT call opc(); sync once after configuring all markers.
+
+        With enable_domain=False the marker is explicitly returned to full
+        span (user range 0) — otherwise a range left over from an earlier
+        configuration would silently keep constraining the search.
 
         Note:
-            spec.index doubles as the user-range number, so each marker
-            searches its own band — no shared-domain conflicts like the
-            E5071C.
+            Ranges are allocated per (measurement, marker) by
+            marker_set_range, so the same marker index on different
+            measurements cannot collide.
         """
         self.marker_enable(spec.index, ch=ch, meas=meas, on=True)
         if spec.enable_domain:
             self.marker_set_range(spec.index, spec.f_start_hz, spec.f_stop_hz, ch=ch, meas=meas)
+        else:
+            self.marker_clear_range(spec.index, ch=ch, meas=meas)
         self.marker_search(spec.index, spec.func, ch=ch, meas=meas)
 
     def marker_read(self, idx: int, ch: int = 1, meas: int = 1) -> Tuple[float, float]:

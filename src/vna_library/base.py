@@ -32,13 +32,38 @@ class VisaSession(Protocol):
     def close(self) -> None: ...
 
 
-def _open_visa(resource: str, timeout_ms: int) -> VisaSession:
+def _open_visa(resource: str, timeout_ms: int, backend: str | None = None) -> VisaSession:
+    """Open a VISA resource, falling back to the pure-Python backend.
+
+    pyvisa is only a frontend: it needs a backend library to talk to
+    instruments.  With backend=None this tries the default (IVI) backend —
+    Keysight IO Libraries / NI-VISA — and falls back to pyvisa-py ("@py")
+    when no vendor library is installed.  Pass "@py" or a visa library path
+    to force a backend.
+    """
     if pyvisa is None:
         raise ImportError(
             "pyvisa is required to open a real instrument; "
             "install it or pass a session object instead of a resource string"
         )
-    rm = pyvisa.ResourceManager()
+    if backend is not None:
+        rm = pyvisa.ResourceManager(backend)
+    else:
+        try:
+            rm = pyvisa.ResourceManager()
+        except (OSError, ValueError) as ivi_exc:
+            try:
+                rm = pyvisa.ResourceManager("@py")
+            except Exception as py_exc:
+                raise InstrumentError(
+                    "No VISA backend available. pyvisa found neither a vendor "
+                    "VISA library (Keysight IO Libraries Suite / NI-VISA) nor "
+                    "the pure-Python backend. Fix with ONE of:\n"
+                    "  pip install pyvisa-py   # pure Python; TCPIP/HiSLIP, fine for "
+                    "P50xx/P93xx via the host-PC firmware\n"
+                    "  or install Keysight IO Libraries Suite (adds USB/GPIB support).\n"
+                    f"(default backend error: {ivi_exc})"
+                ) from py_exc
     session = rm.open_resource(resource)
     session.timeout = timeout_ms
     session.write_termination = "\n"
@@ -86,15 +111,19 @@ def format_limit_payload(table: "LimitTable", include_count: bool) -> str:
 class ScpiInstrument:
     """Base class: session handling, error translation, IEEE-488.2 basics."""
 
-    def __init__(self, session: VisaSession | str, timeout_ms: int = 30000):
+    def __init__(self, session: VisaSession | str, timeout_ms: int = 30000, backend: str | None = None):
         if isinstance(session, str):
-            session = _open_visa(session, timeout_ms)
+            session = _open_visa(session, timeout_ms, backend)
         self.inst = session
 
     @classmethod
-    def open(cls, resource: str, timeout_ms: int = 30000):
-        """Open a real instrument by VISA resource string."""
-        return cls(_open_visa(resource, timeout_ms))
+    def open(cls, resource: str, timeout_ms: int = 30000, backend: str | None = None):
+        """Open a real instrument by VISA resource string.
+
+        backend: None tries the vendor VISA library then falls back to
+        pyvisa-py; "@py" forces the pure-Python backend.
+        """
+        return cls(_open_visa(resource, timeout_ms, backend))
 
     def close(self) -> None:
         self.inst.close()
